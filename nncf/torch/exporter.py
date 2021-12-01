@@ -59,7 +59,7 @@ class PTExporter(Exporter):
 
         :param save_path: The path where the model will be saved.
         """
-        model = self._model.eval().cpu()
+        model = self._model.eval()#.cpu()
         input_tensor_list = []
         for info in self._model.input_infos:
             single_batch_info = copy(info)

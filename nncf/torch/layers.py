@@ -57,6 +57,8 @@ OPTIONAL_PARAMETERS_REGISTRY.register(NNCF_PADDING_VALUE_ATTR_NAME)
 
 class NNCFConv2d(_NNCFModuleMixin, nn.Conv2d):
     op_func_name = "conv2d"
+    scale_factor = None
+    folding_conv_bn = False
 
     def __init__(
         self,
@@ -110,6 +112,42 @@ class NNCFConv2d(_NNCFModuleMixin, nn.Conv2d):
         return F.conv2d(F.pad(input_, self._reversed_padding_repeated_twice, value=self.get_padding_value_ref().item()),
                         weight, bias, self.stride,
                         (0, 0), self.dilation, self.groups)
+
+    def _conv_forward(self, input, weight):
+        if self.folding_conv_bn:
+
+            self.scale_factor = self.pre_ops['0'].op.scale_factor
+            weights_shape = [1] * len(weight.shape)
+            weights_shape[0] = -1
+            bias_shape = [1] * len(weight.shape)
+            bias_shape[1] = -1
+
+
+            if self.bias is not None:
+                zero_bias = torch.zeros_like(self.bias)
+            else:
+                zero_bias = torch.zeros(self.out_channels, device=weight.device)
+            conv = self._nncf_conv_forward(input, weight, zero_bias)
+
+
+            if self.scale_factor is not None:
+                conv_orig = conv / self.scale_factor[0].reshape(bias_shape).to(conv.device)
+            else:
+                conv_orig = conv
+            if self.bias is not None:
+                conv_orig = conv_orig + self.bias.reshape(bias_shape)
+            #conv = self.bn(conv_orig)
+            return conv_orig
+        else:
+            return self._nncf_conv_forward(input, weight, self.bias)
+
+        def _nncf_conv_forward(self, input, weight, bias):
+            if self.padding_mode != 'zeros':
+                return F.conv2d(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                            weight, bias, self.stride,
+                            _pair(0), self.dilation, self.groups)
+            return F.conv2d(input, weight, bias, self.stride,
+                        self.padding, self.dilation, self.groups)
 
 
 class NNCFLinear(_NNCFModuleMixin, nn.Linear):

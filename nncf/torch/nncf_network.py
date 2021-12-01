@@ -68,6 +68,7 @@ from nncf.torch.layers import NNCF_MODULES
 from nncf.torch.layers import NNCF_WRAPPED_USER_MODULES_DICT
 from nncf.torch.module_operations import UpdateWeight
 from nncf.torch.quantization.layers import QUANTIZATION_MODULES
+from nncf.torch.utils import get_pair_conv_bn
 from nncf.torch.utils import compute_FLOPs_hook
 from nncf.torch.utils import get_all_modules_by_type
 from nncf.torch.utils import get_state_dict_names_with_modules
@@ -206,6 +207,7 @@ class NNCFNetwork(nn.Module, PostGraphBuildActing):
 
         # all modules called in eval mode should be replaced prior to graph building
         self._replace_modules_by_nncf_modules(device, eval_only_op_scopes, reset)
+        self.pair_conv_bn = get_pair_conv_bn(self.get_nncf_wrapped_model())
 
         _orig_context = TracingContext()
 
@@ -432,6 +434,7 @@ class NNCFNetwork(nn.Module, PostGraphBuildActing):
                 if node.layer_attributes is not None:  # TODO(vshampor): implement more explicit filtering
                     retval.append(node)
         return retval
+
 
     def get_nncf_modules_by_module_names(self, nncf_module_names_list: List[str]) -> Dict["Scope", torch.nn.Module]:
         return get_all_modules_by_type(self.get_nncf_wrapped_model(), nncf_module_names_list)

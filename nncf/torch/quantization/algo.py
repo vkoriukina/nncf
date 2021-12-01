@@ -569,6 +569,20 @@ class QuantizationBuilder(PTCompressionAlgorithmBuilder):
                     retval[qp_id] = minmax_stat
         return retval
 
+
+        def _make_quantizable_subgraph_pattern(self):
+            full_pattern = self._make_default_quantizable_subgraph_pattern()
+            if self.quantizable_subgraph_patterns is not None:
+                for pattern in self.quantizable_subgraph_patterns:
+                    if not isinstance(pattern, str):
+                        custom_pattern = functools.reduce(operator.add,
+                                                      [NNCFNodeExpression(node) for node in pattern])
+                    else:
+                        custom_pattern = NNCFNodeExpression(pattern)
+                    full_pattern = full_pattern | custom_pattern
+            return full_pattern
+
+
     def _get_transformation_layout(self, target_model: NNCFNetwork) -> PTTransformationLayout:
         # TODO (vshampor): a simpler solution would be to always create callables on CPU and
         # to move these to model-specific device upon actual application, but would this impact
@@ -616,10 +630,6 @@ class QuantizationBuilder(PTCompressionAlgorithmBuilder):
 
         if self._debug_interface is not None:
             target_model.debug_interface.add_interface(self._debug_interface)
-
-        quantization_types = [class_type.__name__ for class_type in QUANTIZATION_MODULES.registry_dict.values()]
-        all_quantizations = get_state_dict_names_with_modules(target_model, quantization_types)
-        target_model._load_listener = LoadStateListener(target_model, all_quantizations)
 
         return transformation_layout
 
@@ -679,9 +689,38 @@ class QuantizationBuilder(PTCompressionAlgorithmBuilder):
                                       build_time_metric_info=self._build_time_metric_infos,
                                       build_time_range_init_params=self._range_init_params)
 
+
     def __create_quantize_module(self, quantizer_spec: PTQuantizerSpec):
         quantizer_cls = QUANTIZATION_MODULES.get(quantizer_spec.mode)
         return quantizer_cls(quantizer_spec)
+
+    def __create_scale_module(self, next_bn, conv):
+        class ScaledWeights(nn.Module):
+            def __init__(self, bn, conv):
+                super().__init__()
+                self.bn = bn
+                self.do_scaling = False
+                self.scale_factor = [torch.ones([self.bn.num_features], device=self.bn.weight.device)]
+
+
+            def forward(self, weight):
+                # W * gamma / sigma
+                if self.do_scaling:
+                    running_std = torch.sqrt(self.bn.running_var + self.bn.eps)
+                    tmp = self.bn.weight / running_std
+                    tmp.to(weight.device)
+                    with torch.no_grad():
+                        self.scale_factor[0] = torch.clamp(tmp, min=1e-5, max=torch.max(tmp))
+                    weights_shape = [1] * len(weight.shape)
+                    weights_shape[0] = -1
+                    bias_shape = [1] * len(weight.shape)
+                    bias_shape[1] = -1
+                    scaled_weight = weight * self.scale_factor[0].reshape(weights_shape)
+                    return scaled_weight
+                else:
+                    return weight
+
+        return ScaledWeights(next_bn, conv)
 
     @staticmethod
     def _get_adjust_padding_args(
@@ -727,6 +766,7 @@ class QuantizationBuilder(PTCompressionAlgorithmBuilder):
             commands.append(PTInsertionCommand(insertion_point, op, TransformationPriority.DEFAULT_PRIORITY))
         return commands
 
+
     class ExternalQuantizerCallHook:
         """
         Cannot simply register the quantizer module as a callable hook, since we need to call
@@ -756,6 +796,7 @@ class QuantizationBuilder(PTCompressionAlgorithmBuilder):
         qp_id_vs_quant_module_id_dict = {}  # type: Dict[QuantizationPointId, QuantizerId]
         target_model_graph = target_model.get_original_graph()
         non_unified_scales_quantization_point_ids = set(quantizer_setup.quantization_points.keys())
+
         already_weight_quantized_shared_layers = {}  # type: Dict[str, QuantizerId]
 
         for unified_scales_group in quantizer_setup.unified_scale_groups.values():
@@ -815,6 +856,7 @@ class QuantizationBuilder(PTCompressionAlgorithmBuilder):
             if qp.is_weight_quantization_point() and nncf_node.is_shared() and \
                     nncf_node.layer_name not in already_weight_quantized_shared_layers:
                 already_weight_quantized_shared_layers[nncf_node.layer_name] = quantizer_module_id
+
 
             qp_id_vs_quant_module_id_dict[qp_id] = quantizer_module_id
             insertion_commands += commands
@@ -1204,10 +1246,18 @@ class QuantizationController(QuantizationControllerBase):
         params = algo_config.get('params', None)
         self.is_staged_scheduler = bool(params)
 
+        scheduler_params = algo_config.get('scheduler_params')
         # Staged scheduler must be created after initialized to prevent extra logic with disabled quantizations
         if self.is_staged_scheduler:
+            if scheduler_params is not None:
+                params.update(scheduler_params)
             scheduler_cls = QUANTIZATION_SCHEDULERS.get("staged")
             self._scheduler = scheduler_cls(self, params)
+        elif scheduler_params is not None:
+            scheduler_cls = QUANTIZATION_SCHEDULERS.get("base")
+            self._scheduler = scheduler_cls(self, scheduler_params)
+
+
 
     @property
     def scheduler(self) -> CompressionScheduler:
@@ -1221,10 +1271,59 @@ class QuantizationController(QuantizationControllerBase):
     def groups_of_adjacent_quantizers(self) -> GroupsOfAdjacentQuantizers:
         return self._groups_of_adjacent_quantizers
 
+    def do_folding_conv_bn(self):
+        for conv in self._model.pair_conv_bn.keys():
+            conv.folding_conv_bn = True
+            conv.pre_ops['0'].op.do_scaling = True
+
+    def freeze_bn_stats(self):
+        for bn in self._model.pair_conv_bn.values():
+            bn.training = False
+
     def prepare_for_export(self):
         for quantizer_id, quantizer in self.all_quantizations.items():
             if not quantizer.is_enabled_quantization():
                 nncf_logger.warning('Disabled quantization on export to ONNX: {}'.format(quantizer_id))
+
+     # remove ScaledWeights module
+        for conv, bn in self._model.pair_conv_bn.items():
+            scaled_wights_op = conv.remove_pre_forward_operation('0')
+            self._fusing_conv2d_and_bn2d(conv, bn)
+        self._replace_bn_identity()
+
+    def _replace_bn_identity(self):
+        def recursively(model):
+            for module_name in model._modules:
+                if isinstance(model._modules[module_name], torch.nn.BatchNorm2d):
+                    model._modules[module_name] = torch.nn.Identity()
+                if len(model._modules[module_name]._modules) > 0:
+                    recursively(model._modules[module_name])
+
+        recursively(self._model)
+
+
+    def _fusing_conv2d_and_bn2d(self, conv, bn):
+        # update weight and bias convolution
+          w = conv.weight
+          b = conv.bias
+          gamma = bn.weight
+          sigma = torch.sqrt(bn.running_var + bn.eps)
+          mu = bn.running_mean
+          betta = bn.bias
+          scale_factor = gamma / sigma
+          scale_factor = torch.clamp(scale_factor, min=1e-5, max=torch.max(scale_factor).data)
+
+          weights_shape = [1] * len(w.shape)
+          weights_shape[0] = -1
+          w_folded = w * scale_factor.reshape(weights_shape)
+          b_folded = - mu * scale_factor + betta
+          if b is not None:
+              b_folded += b
+
+          conv.weight = torch.nn.Parameter(w_folded)
+          conv.bias = torch.nn.Parameter(b_folded)
+          return conv
+
 
     def distributed(self):
         self._distributed = True

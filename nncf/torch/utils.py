@@ -251,6 +251,35 @@ def compute_FLOPs_hook(module, input_, output, dict_to_save, module_node_name: N
     dict_to_save[module_node_name] = 2 * mac_count
 
 
+def get_pair_conv_bn(model):
+    from torch.nn import BatchNorm2d
+
+    from nncf.torch.layers import NNCFConv2d
+
+    def get_modules_for_fusing(model, result):
+        from torch.quantization.fuse_modules import fuse_modules, fuse_known_modules
+        from nncf.torch.dynamic_graph.transform_graph import is_nncf_module
+        prev_module_name = None
+        prev_module = None
+        should_be_fused = []
+        for module_name, module in model._modules.items():
+            if prev_module_name is None:
+                prev_module_name = module_name
+                prev_module = module
+            if len(module._modules) == 0:
+                if isinstance(module, BatchNorm2d) and isinstance(prev_module, NNCFConv2d):
+                    result[prev_module] = module
+            elif not is_nncf_module(module):
+                module = module = get_modules_for_fusing(module, result)
+            prev_module_name = module_name
+            prev_module = module
+        return module
+    res = {}
+    get_modules_for_fusing(model, res)
+
+    return res
+
+
 def add_domain(name_operator: str) -> str:
     from nncf.torch.compression_method_api import DOMAIN_CUSTOM_OPS_NAME
     return DOMAIN_CUSTOM_OPS_NAME + "::" + name_operator

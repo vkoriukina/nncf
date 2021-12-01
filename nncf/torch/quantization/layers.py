@@ -418,7 +418,11 @@ class SymmetricQuantizer(BaseQuantizer):
         self.signed_tensor.fill_(signed)
 
     def quantize(self, x, execute_traced_op_as_identity: bool = False):
-        return symmetric_quantize(x, self.levels, self.level_low, self.level_high, self.scale, self.eps,
+        if hasattr(self, 'scale_factor'):
+            scale = self.scale.data * self.scale_factor[0].reshape(self.scale_shape).to(self.scale.device)
+        else:
+            scale = self.scale
+        return symmetric_quantize(x, self.levels, self.level_low, self.level_high, scale, self.eps,
                                   skip=execute_traced_op_as_identity)
 
     def get_trainable_params(self) -> Dict[str, torch.Tensor]:
@@ -559,7 +563,13 @@ class AsymmetricQuantizer(BaseQuantizer):
         return calculate_asymmetric_level_ranges(num_bits)
 
     def quantize(self, x, execute_traced_op_as_identity: bool = False):
-        return asymmetric_quantize(x, self.levels, self.level_low, self.level_high, self.input_low, self.input_range,
+        if hasattr(self, 'scale_factor'):
+            input_low = self.input_low.data * self.scale_factor[0].reshape(self.scale_shape).to(self.input_low.device)
+            input_range = self.input_range.data * self.scale_factor[0].reshape(self.scale_shape).to(self.input_range.device)
+        else:
+            input_low = self.input_low
+            input_range = self.input_range
+        return asymmetric_quantize(x, self.levels, self.level_low, self.level_high, input_low, input_range,
                                    self.eps, skip=execute_traced_op_as_identity)
 
     def get_trainable_params(self) -> Dict[str, torch.Tensor]:
